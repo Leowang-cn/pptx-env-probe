@@ -1,0 +1,11 @@
+# 项目数据目录：探针的写入测试与 LibreOffice profile 都落在这里
+data/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.env.*
+!.env.example
+.pytest_cache/
+*.log
