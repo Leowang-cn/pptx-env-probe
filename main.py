@@ -10,10 +10,13 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import zipfile
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
+from starlette.concurrency import run_in_threadpool
 
 APP_VERSION = "0.1.0"
 PROBE_DIR = Path(__file__).resolve().parent
@@ -302,10 +305,6 @@ def inspect_pdf_text(pdf: Path):
 def check_render_capability():
     """实测 PPTX→PDF→取字链路。任一环节缺失时明确报告不可测，不伪装成功。"""
     soffice = shutil.which("soffice") or shutil.which("libreoffice")
-    outdir = DATA_DIR / "render-test"
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    # 先判断转换器：没有它就没必要生成样本，也能让结论更直接
     if not soffice:
         return {
             "tested": False,
@@ -314,41 +313,114 @@ def check_render_capability():
             "note": "缺少转换能力不影响 L1/L2 一致性，只影响服务端渲染对账",
         }
 
-    sample = outdir / "sample.pptx"
-    try:
-        sample_size = build_sample_pptx(sample)
-    except Exception as exc:  # noqa: BLE001
-        return {"tested": False, "stage": "生成样本", "reason": repr(exc),
-                "note": "python-pptx 不可用会直接暴露在这一步"}
+    with tempfile.TemporaryDirectory(prefix="pptx-probe-") as directory:
+        sample = Path(directory) / "sample.pptx"
+        try:
+            sample_size = build_sample_pptx(sample)
+        except Exception as exc:  # noqa: BLE001
+            return {"tested": False, "stage": "生成样本", "reason": repr(exc)}
+        return convert_and_inspect(sample, soffice, sample_size)
 
-    # 用项目内 profile，避免无权限写系统 home 导致转换静默失败
-    profile = DATA_DIR / "lo-profile"
+
+def convert_and_inspect(source, soffice, sample_size):
+    """用全新目录与 profile 转换，检查输出而非只看 soffice 的退出码。"""
+    import io
+
+    from importlib.metadata import PackageNotFoundError, version
+
+    outdir = source.parent
+    profile = outdir / "lo-profile"
+    valid_pptx = zipfile.is_zipfile(source)
+    if valid_pptx:
+        with zipfile.ZipFile(source) as archive:
+            valid_pptx = "ppt/presentation.xml" in archive.namelist()
+    if not valid_pptx:
+        return {"tested": False, "stage": "输入校验", "reason": "不是有效的 PPTX 演示文稿"}
+
     started = time.time()
     result = run(
         [
-            soffice, "--headless", "--norestore", "--nolockcheck", "--nodefault",
-            f"-env:UserInstallation=file://{profile}",
-            "--convert-to", "pdf", "--outdir", str(outdir), str(sample),
+            soffice, f"-env:UserInstallation={profile.as_uri()}",
+            "--headless", "--norestore", "--nolockcheck", "--nodefault",
+            "--convert-to", "pdf", "--outdir", str(outdir), str(source),
         ],
         timeout=180,
     )
     elapsed = round(time.time() - started, 2)
-    pdf = outdir / (sample.stem + ".pdf")
+    pdf = outdir / (source.stem + ".pdf")
 
     report = {
         "tested": True,
         "soffice_path": soffice,
         "sample_created": sample_size,
-        "success": pdf.exists(),
+        "input_valid_pptx": valid_pptx,
+        "success": result["ok"] and pdf.is_file() and pdf.stat().st_size > 0,
         "elapsed_seconds": elapsed,
-        "pdf_size_bytes": pdf.stat().st_size if pdf.exists() else 0,
+        "pdf_size_bytes": pdf.stat().st_size if pdf.is_file() else 0,
         "detail": result,
     }
-    if pdf.exists():
+    if report["success"]:
         report["pdf_text"] = inspect_pdf_text(pdf)
+        try:
+            import pypdfium2 as pdfium
+            document = pdfium.PdfDocument(str(pdf))
+            try:
+                report["page_count"] = len(document)
+                page = document[0]
+                try:
+                    bitmap = page.render(scale=min(1600 / page.get_width(), 1600 / page.get_height()))
+                    try:
+                        image = bitmap.to_pil()
+                        output = io.BytesIO()
+                        image.save(output, format="PNG")
+                        report["png_bytes"] = len(output.getvalue())
+                    finally:
+                        bitmap.close()
+                finally:
+                    page.close()
+            finally:
+                document.close()
+            report["png_rendered"] = report["png_bytes"] > 0
+        except (ImportError, PackageNotFoundError) as exc:
+            report["png_rendered"] = False
+            report["png_error"] = repr(exc)
+        except Exception as exc:  # noqa: BLE001 - report failure without hiding PDF result
+            report["png_rendered"] = False
+            report["png_error"] = repr(exc)
+        try:
+            report["pypdfium2_version"] = version("pypdfium2")
+        except PackageNotFoundError:
+            report["pypdfium2_version"] = None
     else:
-        report["note"] = "转换未产出 PDF。若 stderr 提到 profile 或权限，多为 home 不可写"
+        report["note"] = "转换未产出可用 PDF；查看 detail 中的返回码和 stderr"
     return report
+
+
+@app.post("/api/probe/pptx")
+async def probe_pptx(request: Request):
+    """仅供可信内网使用：临时检查上传的真实 PPTX，不保留原件。"""
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if not soffice:
+        raise HTTPException(status_code=503, detail="LibreOffice 不可用")
+    with tempfile.TemporaryDirectory(prefix="pptx-probe-upload-") as directory:
+        source = Path(directory) / "source.pptx"
+        size = 0
+        with source.open("wb") as output:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > 20 * 1024 * 1024:
+                    raise HTTPException(status_code=413, detail="PPTX 超过 20MB")
+                output.write(chunk)
+        if not size:
+            raise HTTPException(status_code=400, detail="PPTX 为空")
+        report = await run_in_threadpool(convert_and_inspect, source, soffice, size)
+        if not report["tested"]:
+            raise HTTPException(status_code=400, detail=report["reason"])
+        if "pdf_text" in report:
+            report["pdf_text"].pop("text_preview", None)
+            report["pdf_text"].pop("superscript_preserved", None)
+            report["pdf_text"].pop("cjk_rendered", None)
+        return report
 
 
 def check_container_render():

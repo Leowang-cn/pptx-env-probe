@@ -66,12 +66,41 @@ PORT=8000 HOST=127.0.0.1 .venv/bin/python3 run.py
 
 独立仓库减少课件素材和历史文件的拉取，但不会减少 Python 依赖的安装耗时。依赖版本暂时保持原有基线，以便对照服务器探测结果。
 
-## 两个接口的分工
+## 接口的分工
 
 | 接口 | 用途 | 耗时 |
 | --- | --- | --- |
 | `/api/health` | 部署验收入口（平台会调它）。只返回轻量信息：Python 版本、能否起子进程、LibreOffice 是否存在 | 快 |
 | `/api/probe` | 完整报告。含字体枚举、PPTX→PDF 实测、Redis/MinIO 连通性、依赖版本核对 | 首次较慢（要跑一次真实转换） |
+| `POST /api/probe/pptx` | 临时检测真实 PPTX 的 PDF 转换与首页 PNG 渲染，不调用共享存储探测 | 转换超时为 180 秒 |
+
+### 真实课件检查
+
+仅供可信内网使用，接口没有身份认证。请求体直接发送 PPTX 二进制，不使用 multipart；上限为 20 MiB。空文件或无效 PPTX 返回 400，超过大小限制返回 413，缺少 LibreOffice 返回 503。
+
+```sh
+curl --fail-with-body -X POST \
+	-H 'Content-Type: application/vnd.openxmlformats-officedocument.presentationml.presentation' \
+	--data-binary @lesson.pptx http://127.0.0.1:8000/api/probe/pptx
+```
+
+每次样例或上传检查均使用独立临时目录和 LibreOffice profile，完成或异常退出后清理原件与产物。上传响应不包含正文摘录、图片内容或样例专属上标判断。
+
+- `success` 表示转换命令成功退出且产出非空 PDF；不等同于视觉保真或整条预览链通过。
+- `detail` 保留命令执行诊断；退出码为零但没有 PDF 时仍报告失败。
+- `page_count`、`png_rendered`、`png_bytes` 表示 PDFium 能否读取 PDF 并将首页编码为 PNG；不验证其他页面。
+- `pdf_text.cjk_chars_in_pdf` 仅统计可提取的中文字符，不能证明字体外观或动画正确。
+- `pypdfium2_version`、`png_error` 用于区分 PDF 转换与 PNG 渲染问题。
+
+PDFium 固定为 `4.30.0`，与 Aippt 预览链保持一致。镜像可查询到包不代表该版本已在目标服务器安装成功；部署后仍需实测。LibreOffice profile 参数顺序已调整，是否解决服务器 5.3.6 的失败也须现场验证。
+
+本地回归测试：
+
+```sh
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+测试使用模拟的 LibreOffice 执行结果和真实 PDFium 编码，不替代服务器真实 PPTX 转换验收。
 
 ## 它能回答哪些问题
 
@@ -106,7 +135,7 @@ PORT=8000 HOST=127.0.0.1 .venv/bin/python3 run.py
 
 ## 依赖版本
 
-`requirements.txt` 里的版本上限全部来自部署后台「环境信息 → 依赖版本查询」实测，不是照抄官方最新版。该机器从内网镜像装包，且 gcc 4.8.5 / glibc 2.17，需要现场编译的依赖装不上。
+原有依赖基线来自部署后台「环境信息 → 依赖版本查询」；新增 PDFium 的固定版本及验证边界见上文。该机器从内网镜像装包，且 gcc 4.8.5 / glibc 2.17，需要现场编译的依赖装不上。
 
 新增依赖前请先在后台查询确认，再改这个文件。
 
