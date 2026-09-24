@@ -73,6 +73,18 @@ PORT=8000 HOST=127.0.0.1 .venv/bin/python3 run.py
 | `/api/health` | 部署验收入口（平台会调它）。只返回轻量信息：Python 版本、能否起子进程、LibreOffice 是否存在 | 快 |
 | `/api/probe` | 完整报告。含字体枚举、PPTX→PDF 实测、Redis/MinIO 连通性、依赖版本核对 | 首次较慢（要跑一次真实转换） |
 | `POST /api/probe/pptx` | 临时检测真实 PPTX 的 PDF 转换与首页 PNG 渲染，不调用共享存储探测 | 转换超时为 180 秒 |
+| `GET /api/probe/libreoffice` | 固定的 LibreOffice 组件、RPM 和临时目录权限诊断 | 命令有独立超时，最坏约 60 秒 |
+
+### 无服务器终端时的诊断
+
+部署后直接在浏览器打开 `/api/probe/libreoffice`。该接口不接受命令或路径参数，不安装软件、不修改系统配置、不调用 Redis、MinIO 或容器。
+
+- `executable`、`resolved_executable`、`version`：执行文件、解析后的路径和版本命令结果。
+- `rpm_packages`：固定查询 core、impress、draw、ure 四个发行版包的版本；失败时保留退出码和错误，命令不存在时报告 `rpm_unavailable`。其他安装方式或包命名可能不会被这些查询覆盖。
+- `component_files`：常见安装目录与执行文件所在安装目录中的 Impress、OOXML 库及注册表文件；未找到不等于组件一定缺失。
+- `temporary_io`：创建并清理临时测试文件，实测探针进程的输入读取和输出写入，不证明 LibreOffice 子进程或沙箱有相同权限。
+
+接口无身份认证，仅限可信内网。诊断结果是排查线索，不能代替真实 PPTX 转换验收。
 
 ### 真实课件检查
 

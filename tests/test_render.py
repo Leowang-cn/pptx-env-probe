@@ -10,6 +10,31 @@ import main
 
 
 class RenderTests(unittest.TestCase):
+    def test_diagnostics_without_tools(self):
+        with patch.object(main.shutil, "which", return_value=None), patch.object(main, "run") as execute:
+            report = main.diagnose_libreoffice()
+        execute.assert_not_called()
+        self.assertTrue(report["rpm_unavailable"])
+        self.assertIsNone(report["version"])
+        self.assertTrue(report["temporary_io"]["input_readable"])
+        self.assertTrue(report["temporary_io"]["output_writable"])
+
+    def test_diagnostics_use_only_fixed_commands(self):
+        def which(name):
+            return {"soffice": "/usr/bin/soffice", "rpm": "/usr/bin/rpm"}.get(name)
+
+        failure = {"ok": False, "returncode": 1, "stdout": "", "stderr": "unavailable"}
+        with patch.object(main.shutil, "which", side_effect=which), patch.object(main, "run", return_value=failure) as execute:
+            report = main.diagnose_libreoffice()
+        self.assertEqual(execute.call_count, 5)
+        self.assertEqual(execute.call_args_list[0].args[0], ["/usr/bin/soffice", "--version"])
+        self.assertEqual(set(report["rpm_packages"]), {
+            "libreoffice-core", "libreoffice-impress", "libreoffice-draw", "libreoffice-ure",
+        })
+        for call in execute.call_args_list[1:]:
+            self.assertEqual(call.args[0][:3], ["/usr/bin/rpm", "-q", "--qf"])
+        self.assertFalse(report["rpm_packages"]["libreoffice-impress"]["ok"])
+
     def test_pdf_is_rendered_to_png(self):
         import pypdfium2 as pdfium
 

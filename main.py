@@ -45,6 +45,63 @@ def run(cmd, timeout=15):
         return {"ok": False, "returncode": None, "stdout": "", "stderr": repr(exc)}
 
 
+@app.get("/api/probe/libreoffice")
+def diagnose_libreoffice():
+    executable = shutil.which("soffice") or shutil.which("libreoffice")
+    report = {
+        "executable": executable,
+        "resolved_executable": None,
+        "version": None,
+        "rpm_packages": {},
+        "component_files": [],
+        "note": "固定路径未找到文件不等于组件缺失；请结合 RPM 和转换结果判断。",
+    }
+    roots = {Path("/usr/lib64/libreoffice"), Path("/usr/lib/libreoffice"), Path("/opt/libreoffice")}
+    if executable:
+        try:
+            resolved = Path(executable).resolve()
+            report["resolved_executable"] = str(resolved)
+            roots.add(resolved.parent.parent)
+        except (OSError, RuntimeError) as exc:
+            report["resolve_error"] = repr(exc)
+        report["version"] = run([executable, "--version"], timeout=20)
+    rpm = shutil.which("rpm")
+    if rpm:
+        for package in ("libreoffice-core", "libreoffice-impress", "libreoffice-draw", "libreoffice-ure"):
+            report["rpm_packages"][package] = run(
+                [rpm, "-q", "--qf", "%{NAME} %{VERSION}-%{RELEASE} %{ARCH}\\n", package],
+                timeout=10,
+            )
+    else:
+        report["rpm_unavailable"] = True
+    for root in sorted(roots):
+        for relative in ("program/simpress", "program/libsdlo.so", "program/libooxlo.so", "share/registry/impress.xcd"):
+            candidate = root / relative
+            item = {"path": str(candidate)}
+            try:
+                item["exists"] = candidate.is_file()
+                item["readable"] = os.access(candidate, os.R_OK) if item["exists"] else None
+            except OSError as exc:
+                item["error"] = repr(exc)
+            report["component_files"].append(item)
+    try:
+        with tempfile.TemporaryDirectory(prefix="pptx-probe-diagnostic-") as directory:
+            source = Path(directory) / "input.bin"
+            source.write_bytes(b"probe-input")
+            output = Path(directory) / "output"
+            output.mkdir()
+            target = output / "write-check.bin"
+            target.write_bytes(b"probe-output")
+            report["temporary_io"] = {
+                "input_readable": source.read_bytes() == b"probe-input",
+                "output_writable": target.read_bytes() == b"probe-output",
+                "note": "仅证明探针进程的读写权限，不证明 LibreOffice 子进程或沙箱的访问权限。",
+            }
+    except OSError as exc:
+        report["temporary_io"] = {"error": repr(exc)}
+    return report
+
+
 def check_runtime():
     return {
         "python_version": sys.version.split()[0],
